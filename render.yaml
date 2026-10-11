@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: audio-splitter
+    runtime: docker
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: FILE_TTL_SECONDS
+        value: "21600"
+      - key: RETRY_AFTER_SECONDS
+        value: "30"
+      - key: ALLOWED_HOST_SUFFIXES
+        value: "sharepoint.com"
