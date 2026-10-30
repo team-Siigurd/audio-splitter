@@ -9,11 +9,11 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-app = FastAPI(title="Audio Splitter", version="2.0.0")
+app = FastAPI(title="Audio Splitter", version="2.1.0")
 
 # -----------------------------------------------------------------------------
 # Configuration
@@ -26,6 +26,7 @@ RETRY_AFTER_SECONDS = int(os.getenv("RETRY_AFTER_SECONDS", "30"))
 DOWNLOAD_CONNECT_TIMEOUT = int(os.getenv("DOWNLOAD_CONNECT_TIMEOUT", "30"))
 DOWNLOAD_READ_TIMEOUT = int(os.getenv("DOWNLOAD_READ_TIMEOUT", "900"))
 MAX_DOWNLOAD_BYTES = int(os.getenv("MAX_DOWNLOAD_BYTES", str(2 * 1024 * 1024 * 1024)))
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(MAX_DOWNLOAD_BYTES)))
 
 # Intended source is OneDrive/SharePoint. Override with a comma-separated list,
 # e.g. "sharepoint.com,example.com". Set to "*" to allow any HTTPS host.
@@ -142,16 +143,21 @@ def download_source(source_url: str, target: Path) -> int:
     return downloaded
 
 
-def process_audio_job(job_id: str, source_url: str, segment_seconds: int) -> None:
+def process_audio_job(job_id: str, source_url: str | None, segment_seconds: int) -> None:
     job_dir = _job_dir(job_id)
     source_file = job_dir / "source_media"
 
     try:
         job_dir.mkdir(parents=True, exist_ok=True)
 
-        set_job(job_id, status="processing", stage="downloading")
-        downloaded = download_source(source_url, source_file)
-        set_job(job_id, downloaded_bytes=downloaded, stage="splitting")
+        if source_url is not None:
+            set_job(job_id, status="processing", stage="downloading")
+            downloaded = download_source(source_url, source_file)
+            set_job(job_id, downloaded_bytes=downloaded)
+
+        # Uploads have already been copied to source_media before the task starts.
+        # Both input methods use the same conversion and chunking settings.
+        set_job(job_id, status="processing", stage="splitting")
 
         output_pattern = job_dir / "chunk_%03d.mp3"
 
@@ -226,7 +232,7 @@ def process_audio_job(job_id: str, source_url: str, segment_seconds: int) -> Non
 def root():
     return {
         "service": "audio-splitter",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "health": "/health",
     }
 
@@ -276,6 +282,76 @@ def split_audio(payload: SplitRequest, background_tasks: BackgroundTasks, reques
     }
 
 
+@app.post("/split-upload", status_code=202)
+def split_uploaded_audio(
+    background_tasks: BackgroundTasks,
+    request: Request,
+    file: UploadFile = File(...),
+    segment_seconds: int = Form(default=900, ge=60, le=3600),
+):
+    """Accept a multipart file and queue the same processing as URL input.
+
+    FastAPI spools the multipart upload before this function is called. Copy it
+    in bounded chunks to an app-owned path: UploadFile is closed when the request
+    ends and must not be passed into a background task.
+    """
+    cleanup_old_jobs()
+    job_id = str(uuid.uuid4())
+    job_dir = _job_dir(job_id)
+    source_file = job_dir / "source_media"
+    uploaded = 0
+
+    try:
+        if file.size is not None and file.size > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Uploaded file exceeds MAX_UPLOAD_BYTES ({MAX_UPLOAD_BYTES}).",
+            )
+
+        job_dir.mkdir(parents=True, exist_ok=True)
+        with source_file.open("wb") as output:
+            while chunk := file.file.read(1024 * 1024):
+                uploaded += len(chunk)
+                if uploaded > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Uploaded file exceeds MAX_UPLOAD_BYTES ({MAX_UPLOAD_BYTES}).",
+                    )
+                output.write(chunk)
+
+        if uploaded == 0:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+        now = time.time()
+        _write_job(
+            job_id,
+            {
+                "job_id": job_id,
+                "status": "queued",
+                "stage": "queued",
+                "segment_seconds": segment_seconds,
+                "uploaded_bytes": uploaded,
+                "created_at": now,
+                "updated_at": now,
+            },
+        )
+    except Exception:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
+    finally:
+        file.file.close()
+
+    background_tasks.add_task(process_audio_job, job_id, None, segment_seconds)
+
+    base_url = str(request.base_url).rstrip("/")
+    return {
+        "job_id": job_id,
+        "status": "processing",
+        "status_url": f"{base_url}/status/{job_id}",
+        "retry_after_seconds": RETRY_AFTER_SECONDS,
+    }
+
+
 @app.get("/status/{job_id}")
 def job_status(job_id: str, request: Request):
     job = get_job(job_id)
@@ -292,6 +368,8 @@ def job_status(job_id: str, request: Request):
 
     if "downloaded_bytes" in job:
         response["downloaded_bytes"] = job["downloaded_bytes"]
+    if "uploaded_bytes" in job:
+        response["uploaded_bytes"] = job["uploaded_bytes"]
 
     if job.get("status") == "done":
         base_url = str(request.base_url).rstrip("/")

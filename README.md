@@ -1,8 +1,8 @@
-# Audio Splitter for Render + Make
+# Audio Splitter for Render + Make — 2.1.0
 
-FastAPI service that downloads a OneDrive/SharePoint audio file, splits/transcodes it with FFmpeg, and exposes the resulting MP3 chunks over HTTP.
+FastAPI service that accepts either a OneDrive/SharePoint download URL or a direct file upload, splits/transcodes the media with FFmpeg, and exposes the resulting MP3 chunks over HTTP. MP3/WAV audio and MP4 video with an audio track can use either input method.
 
-This version is asynchronous from Make's point of view: `POST /split` returns a `job_id` immediately, while the download and FFmpeg work continue in the background. Make can poll `GET /status/{job_id}` until the job is finished.
+The existing `POST /split` JSON interface remains available. The new `POST /split-upload` accepts multipart file data from Make. Both return the same `job_id` and `status_url` response and run the FFmpeg work in the background. A file upload must finish and be saved before its `202 Accepted` response is returned; conversion does not have to finish first. Your existing size branches, fixed waits, status requests and chunk processing can remain in place.
 
 ## Files
 
@@ -10,6 +10,7 @@ This version is asynchronous from Make's point of view: `POST /split` returns a 
 - `requirements.txt` - Python dependencies
 - `Dockerfile` - Render/Docker image with FFmpeg
 - `render.yaml` - optional Render Blueprint
+- `MAKE_UPLOAD_DA.md` - Danish Make configuration and deployment instructions
 - `.gitignore`
 
 ## API
@@ -52,6 +53,32 @@ Immediate response (`202 Accepted`):
   "retry_after_seconds": 30
 }
 ```
+
+### Start a job by uploading the actual file
+
+```http
+POST /split-upload
+Content-Type: multipart/form-data; boundary=...
+```
+
+| Form field | Type | Value |
+| --- | --- | --- |
+| `file` | File | Actual file bytes and a filename. Required. |
+| `segment_seconds` | Text/integer | Optional; default `900`; allowed range `60`–`3600`. |
+
+For example:
+
+```bash
+curl --request POST 'https://YOUR-RENDER-SERVICE/split-upload' \
+  --form 'file=@podcast.mp3' \
+  --form 'segment_seconds=900'
+```
+
+Let your HTTP client create the multipart boundary; do not set a bare `Content-Type` header manually. This endpoint accepts a multipart file, not a base64 string, a JSON `data` field, or an unframed binary request body.
+
+The successful response is the same `202 Accepted` shape as `/split`. Empty files return `400`; files larger than `MAX_UPLOAD_BYTES` return `413`; a missing file or invalid segment length returns `422`. If FFmpeg cannot read a file after it has been accepted, the job's status becomes `error` and `/status/{job_id}` provides the reason.
+
+The upload is copied to an application-owned job file before background processing starts. The request's temporary upload handle is not used by the background task. The submitted filename is never used as a filesystem path. FastAPI may spool multipart files to temporary disk before endpoint validation; the byte limit is an accepted-file limit, not an upstream request-body limit.
 
 ### Check job
 
@@ -143,8 +170,6 @@ Do not increase the Uvicorn worker count for this simple version.
 
 The repository also contains `render.yaml`. You can create a Blueprint in Render from the repository instead of manually creating the Web Service.
 
-`plan: starter` is only a suggested default. Change the plan in Render if necessary.
-
 ## Environment variables
 
 Defaults are already included in the Docker image:
@@ -158,6 +183,7 @@ Defaults are already included in the Docker image:
 | `DOWNLOAD_CONNECT_TIMEOUT` | `30` | HTTP connect timeout in seconds |
 | `DOWNLOAD_READ_TIMEOUT` | `900` | Source download read timeout |
 | `MAX_DOWNLOAD_BYTES` | `2147483648` | Max input file size, default 2 GiB |
+| `MAX_UPLOAD_BYTES` | Value of `MAX_DOWNLOAD_BYTES` | Max accepted uploaded file size. Optional separate override. |
 
 If you ever want to accept sources from another host, set e.g.:
 
@@ -169,30 +195,29 @@ Using `*` allows any HTTPS source and is less safe.
 
 ## Make scenario change
 
-For files that need splitting, the Make branch should become:
+For an existing URL-based branch, keep `POST /split` and its JSON body unchanged.
 
-```text
-OneDrive Watch
-  -> HTTP POST /split
-  -> save job_id/status_url
-  -> wait
-  -> HTTP GET /status/{job_id}
-  -> if processing: wait/check again
-  -> if done: iterate chunks[]
-  -> HTTP Download File
-  -> OpenAI transcription
-```
+For a branch that should send Make's actual file data, change only the starting HTTP request:
 
-For small files, keep your direct OpenAI path.
+1. Set the URL to `https://YOUR-RENDER-SERVICE/split-upload` and Method to `POST`.
+2. Choose **Body content type → multipart/form-data (supports file uploads)**.
+3. Add a body item: **Name** `file`, **Field type** `File`, **Data** from the source module's binary Data output, and **File name** from that same module.
+4. Add a second item: **Name** `segment_seconds`, **Field type** `Text`, **Value** `900`.
+5. Keep **Parse response** enabled and retain the existing timeout, fixed wait modules and subsequent GET request to the returned `status_url`.
 
-Recommended router logic:
+For OneDrive module 18, use `{{18.data}}` and `{{18.filename}}`. For a CloudConvert result, choose both Data and Filename from the current CloudConvert module instead. Do not combine one module's data with a different module's filename.
 
-```text
-< 25 MB  -> direct download -> OpenAI transcription
->= 25 MB -> /split job -> poll -> chunks -> OpenAI transcription
-```
+No router thresholds, wait durations, loops or automatic retries are introduced by this update. The existing `/status/{job_id}` and `/files/{job_id}/{filename}` interfaces remain available. Upload jobs additionally expose `uploaded_bytes` in their status; URL jobs retain `downloaded_bytes`.
 
-The large-file branch does not need Make to download the original 171 MB file before calling `/split`. Pass OneDrive's `@microsoft.graph.downloadUrl` directly to this service.
+## Updating the existing Render deployment
+
+Replace `app.py` and `requirements.txt` in the source repository connected to your existing Render service, then deploy that commit. `python-multipart==0.0.32` is required for the new file-upload endpoint, so a normal Docker rebuild/deploy is required. Merely restarting an older image does not install the change. The Dockerfile and Render Blueprint do not need changes.
+
+After deployment, `GET /` reports version `2.1.0`, and `/docs` includes `POST /split-upload`. Existing `/split` callers can continue using the old input format. Switch a Make branch to the upload endpoint only after this version is deployed.
+
+## Local verification
+
+Install the development dependencies with `pip install -r requirements-dev.txt`, ensure `ffmpeg` and `ffprobe` are available, and run `pytest`. Integration tests generate synthetic audio/video locally; they do not call Make, Render, OneDrive or OpenAI.
 
 ## Important Render limitation
 
